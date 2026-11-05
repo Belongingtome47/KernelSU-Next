@@ -31,7 +31,7 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-accept sdk licenses: true
+        accept sdk licenses: true
 
       - name: Install NDK & Build Dependencies
         run: |
