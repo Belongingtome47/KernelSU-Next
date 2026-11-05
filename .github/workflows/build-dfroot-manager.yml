@@ -23,8 +23,14 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Set Writable Android SDK Path
+        run: |
+          mkdir -p "$HOME/android-sdk"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+
       - name: Setup Android SDK
-        uses: maximinlv/setup-android-sdk
+        uses: android-actions/setup-android@v3
 
       - name: Install NDK & Build Dependencies
         run: |
