@@ -24,7 +24,7 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: maximinlv/setup-android-sdk
 
       - name: Install NDK & Build Dependencies
         run: |
