@@ -1,0 +1,215 @@
+name: Build S26 Ultra DirtyFrag Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'Target KMI for S26 Ultra'
+        required: true
+        default: 'android16-6.12'
+        type: choice
+        options:
+          - android16-6.12
+          - android15-6.6
+      ddk_release:
+        description: 'DDK container release tag'
+        required: true
+        default: '20260828'
+        type: string
+
+jobs:
+  # =========================================================================
+  # JOB 1: Build & Strip [KMI]_kernelsu.ko using the Android DDK Container
+  # =========================================================================
+  build-lkm:
+    name: Build ${{ inputs.kmi }}_kernelsu.ko
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Compile and Strip Kernel Module
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          KDIR="/ddk/${{ inputs.kmi }}"
+          if [ ! -d "$KDIR" ]; then
+            KDIR=$(find / -maxdepth 3 -name "build.config*" -printf '%h\n' 2>/dev/null | head -n 1 || echo "/ddk/kernel")
+          fi
+
+          echo "=== Building kernelsu.ko for ${{ inputs.kmi }} ==="
+          cd kernel
+          make -C "$KDIR" M="$PWD" src="$PWD" modules CONFIG_KSU=m
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          OUTPUT_KO="$GITHUB_WORKSPACE/out/${{ inputs.kmi }}_kernelsu.ko"
+          cp -f kernelsu.ko "$OUTPUT_KO"
+
+          # Strip debug symbols while keeping .symtab/.strtab for module loader relocation
+          llvm-strip -d "$OUTPUT_KO"
+          ls -lh "$OUTPUT_KO"
+
+      - name: Upload LKM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lkm-${{ inputs.kmi }}
+          path: out/${{ inputs.kmi }}_kernelsu.ko
+          if-no-files-found: error
+
+  # =========================================================================
+  # JOB 2: Build ksuinit + Embed LKM & ksuinit into ksud (aarch64)
+  # =========================================================================
+  build-ksud:
+    name: Build ksud (with embedded LKM & ksuinit)
+    needs: build-lkm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Rust Toolchain (aarch64-linux-android)
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Setup Android NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            userspace/ksuinit
+            userspace/ksud
+          cache-targets: false
+
+      - name: Build Static ksuinit (16KB Page Size Aligned)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CLANG_PATH="$LLVM_BIN/aarch64-linux-android26-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG_PATH"
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+
+          cargo build --target=aarch64-linux-android --release --manifest-path ./userspace/ksuinit/Cargo.toml
+
+      - name: Download LKM Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lkm-${{ inputs.kmi }}
+          path: staged-lkm
+
+      - name: Stage ksuinit and LKM into userspace/ksud/bin/aarch64
+        run: |
+          mkdir -p userspace/ksud/bin/aarch64
+          cp -f userspace/ksuinit/target/aarch64-linux-android/release/ksuinit \
+                userspace/ksud/bin/aarch64/ksuinit
+          cp -f staged-lkm/${{ inputs.kmi }}_kernelsu.ko \
+                userspace/ksud/bin/aarch64/${{ inputs.kmi }}_kernelsu.ko
+          chmod +x userspace/ksud/bin/aarch64/ksuinit
+          ls -lh userspace/ksud/bin/aarch64/
+
+      - name: Build ksud (Embedding Assets via rust-embed)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CLANG_PATH="$LLVM_BIN/aarch64-linux-android26-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG_PATH"
+
+          # Clean ksud crate first so rust-embed is guaranteed to bundle the staged assets
+          cargo clean -p ksud --manifest-path ./userspace/ksud/Cargo.toml
+          cargo build --target=aarch64-linux-android --release --manifest-path ./userspace/ksud/Cargo.toml
+
+          # Verify that the LKM filename is embedded inside the compiled ksud binary
+          strings userspace/ksud/target/aarch64-linux-android/release/ksud | grep "${{ inputs.kmi }}_kernelsu.ko"
+
+      - name: Upload Standalone ksud Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksud-aarch64-linux-android
+          path: userspace/ksud/target/aarch64-linux-android/release/ksud
+          if-no-files-found: error
+
+  # =========================================================================
+  # JOB 3: Embed ksud as libksud.so and Build Signed Manager APK
+  # =========================================================================
+  build-manager:
+    name: Build Signed Manager APK (with libksud.so)
+    needs: build-ksud
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download Embedded ksud Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ksud-aarch64-linux-android
+          path: downloaded-ksud
+
+      - name: Stage ksud into Manager jniLibs as libksud.so
+        run: |
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          cp -f downloaded-ksud/ksud manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          chmod 755 manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          ls -lh manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Configure Signing Keystore from Secrets
+        if: ${{ secrets.KEYSTORE != '' }}
+        working-directory: ./manager
+        run: |
+          echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
+          {
+            echo ""
+            echo "KEYSTORE_FILE=key.jks"
+            echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
+            echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
+            echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
+          } >> gradle.properties
+
+      - name: Compile Release Manager APK
+        working-directory: ./manager
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean assembleRelease
+
+      - name: Verify libksud.so Inside Compiled APK
+        run: |
+          APK_PATH=$(find manager/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          echo "Built APK: $APK_PATH"
+          unzip -l "$APK_PATH" | grep "lib/arm64-v8a/libksud.so"
+
+      - name: Upload Signed Manager APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-Manager-S26U-${{ inputs.kmi }}
+          path: manager/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
