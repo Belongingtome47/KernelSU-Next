@@ -62,16 +62,20 @@ jobs:
           chmod +x gradlew
           ./gradlew :app:verifyPayloads
 
-      - name: Fix gradlew permissions
-        run: |
-         sudo apt-get update
-         sudo apt-get install-y dos2unix dos2unix gradlew
+- name: Configure Signing Keystore & Build APK
+  run: |
+   # 1. Grant execution permissions to Gradle wrapper (fixes exit code 126)
+    chmod +x ./gradlew
 
-      - name: Build Manager APK (Release)
-        working-directory: ./manager
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleRelease
+    # 2. Decode the Base64 GitHub Secret into your keystore file
+    echo "${{ secrets.SIGNING_KEY_BASE64 }}" | base64 --decode > release-key.jks
+
+    # 3. Build the signed release APK using your GitHub repository secrets
+    ./gradlew assembleRelease \
+      -Pandroid.injected.signing.store.file=release-key.jks \
+      -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+      -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+      -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
 
       - name: Upload Manager APK Artifact
         uses: actions/upload-artifact@v4
