@@ -65,6 +65,7 @@ jobs:
       - name: Build Manager APK (Release)
         working-directory: ./manager
         run: |
+          chmod +x gradlew
           ./gradlew assembleRelease
 
       - name: Upload Manager APK Artifact
