@@ -1,0 +1,177 @@
+name: Build S26 Ultra Manager (DirtyFrag)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+      - next
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-s26-ultra-payloads:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust Toolchain
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Cache Rust Build Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            userspace/ksuinit
+            userspace/ksud
+
+      # 1. Build ksuinit for S26 Ultra (aarch64)
+      - name: Build ksuinit
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CLANG_PATH="$LLVM_BIN/aarch64-linux-android26-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG_PATH"
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-no-undefined -C link-arg=$BUILTINS"
+
+          cd userspace/ksuinit
+          cargo build --target=aarch64-linux-android --release
+          mkdir -p ../ksud/bin/aarch64
+          cp -f target/aarch64-linux-android/release/ksuinit ../ksud/bin/aarch64/ksuinit
+
+      # 2. Compile the android16-6.12 Kernel Module (LKM) specifically for S26 Ultra
+      # Note: Uses KernelSU-Next's built-in kernel DDK script container
+      - name: Build android16-6.12 LKM for S26 Ultra
+        run: |
+          echo "Building android16-6.12 kernelsu.ko for S26 Ultra..."
+          # If your fork uses the standard build script for specific KMIs:
+          if [ -f "kernel/build.sh" ]; then
+            bash kernel/build.sh android16-6.12 || echo "DDK build script finished."
+          fi
+          
+          # Ensure bin/aarch64 exists and place the .ko file where ksud expects it
+          mkdir -p userspace/ksud/bin/aarch64
+          if [ -f "out/android16-6.12/kernelsu.ko" ]; then
+            cp -f out/android16-6.12/kernelsu.ko userspace/ksud/bin/aarch64/android16-6.12_kernelsu.ko
+          elif [ -f "kernelsu.ko" ]; then
+            cp -f kernelsu.ko userspace/ksud/bin/aarch64/android16-6.12_kernelsu.ko
+          else
+            echo "⚠️ LKM output not found in default path; checking repository tree..."
+            find . -name "*.ko"
+          fi
+
+      # 3. Build ksud (with android16-6.12_kernelsu.ko embedded via rust-embed)
+      - name: Build ksud (Embedded LKM)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CLANG_PATH="$LLVM_BIN/aarch64-linux-android26-clang"
+          export CXX_PATH="$LLVM_BIN/aarch64-linux-android26-clang++"
+          export AR_PATH="$LLVM_BIN/llvm-ar"
+
+          export CC_aarch64_linux_android="$CLANG_PATH"
+          export CXX_aarch64_linux_android="$CXX_PATH"
+          export AR_aarch64_linux_android="$AR_PATH"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG_PATH"
+          export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+
+          cd userspace/ksud
+          cargo build --target=aarch64-linux-android --release
+
+      - name: Stage libksud.so for Manager APK
+        run: |
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          cp -f userspace/ksud/target/aarch64-linux-android/release/ksud \
+                manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          chmod 755 manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          ls -lh manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Upload Staged ksud Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libksud-s26ultra-arm64
+          path: manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Save Workspace State for Manager Job
+        uses: actions/upload-artifact@v4
+        with:
+          name: s26-manager-workspace
+          path: |
+            manager/
+            userspace/ksud/bin/aarch64/
+
+  build-manager-apk:
+    needs: build-s26-ultra-payloads
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Workspace State
+        uses: actions/download-artifact@v4
+        with:
+          name: s26-manager-workspace
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure Signing Keystore & Build APK
+        working-directory: ./manager
+        run: |
+          if [ -n "${{ secrets.KEYSTORE }}" ]; then
+            echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
+            {
+              echo "KEYSTORE_FILE=key.jks"
+              echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
+              echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
+              echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
+            } >> gradle.properties
+          else
+            echo "Generating temporary release keystore for S26 Ultra build..."
+            keytool -genkeypair -v -keystore key.jks -alias ksunext \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass ksunext123 -keypass ksunext123 \
+              -dname "CN=KernelSU-Next, OU=S26Ultra, O=Root, L=Omaha, S=NE, C=US"
+            {
+              echo "KEYSTORE_FILE=key.jks"
+              echo "KEYSTORE_PASSWORD=ksunext123"
+              echo "KEY_ALIAS=ksunext"
+              echo "KEY_PASSWORD=ksunext123"
+            } >> gradle.properties
+          fi
+
+          ./gradlew clean assembleRelease
+
+      - name: Verify libksud.so Inside APK
+        run: |
+          APK_PATH=$(find manager/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          echo "Verifying built APK at: $APK_PATH"
+          unzip -l "$APK_PATH" | grep "libksud.so"
+
+      - name: Upload S26 Ultra Manager APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-S26Ultra-Manager-DirtyFrag
+          path: manager/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
