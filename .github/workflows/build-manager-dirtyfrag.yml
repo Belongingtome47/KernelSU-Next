@@ -1,1 +1,149 @@
-dirtyfrag preload
+name: Build Manager (Embedded ksud for DirtyFrag)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+      - next
+  workflow_dispatch:
+    inputs:
+      build_spoofed:
+        description: 'Also build spoofed package name APK'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Step 1: Build the per-KMI kernelsu.ko LKM binaries that ksud late-load needs
+  build-lkm:
+    uses: ./.github/workflows/build-lkm.yml
+    secrets: inherit
+
+  # Step 2: Build ksuinit for userspace initialization
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+
+  # Step 3: Build ksud for arm64 (and x86_64 if Gradle expects it) with LKMs embedded
+  build-ksud:
+    needs: [build-lkm, build-ksuinit]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+          - target: x86_64-linux-android
+            os: ubuntu-latest
+    uses: ./.github/workflows/ksud.yml
+    with:
+      target: ${{ matrix.target }}
+      os: ${{ matrix.os }}
+
+  # Step 4: Inject ksud as libksud.so into jniLibs and build the Manager APK
+  build-manager:
+    needs: build-ksud
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./manager
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure Signing Keystore
+        run: |
+          if [ -n "${{ secrets.KEYSTORE }}" ]; then
+            echo "Using repository secret KEYSTORE..."
+            echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
+            {
+              echo "KEYSTORE_FILE=key.jks"
+              echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
+              echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
+              echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
+            } >> gradle.properties
+          else
+            echo "No KEYSTORE secret found; generating temporary release keystore..."
+            keytool -genkeypair -v \
+              -keystore key.jks \
+              -alias ksunext \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass ksunext123 \
+              -keypass ksunext123 \
+              -dname "CN=KernelSU-Next, OU=Dev, O=Nowhere, L=Nowhere, S=Nowhere, C=US"
+            {
+              echo "KEYSTORE_FILE=key.jks"
+              echo "KEYSTORE_PASSWORD=ksunext123"
+              echo "KEY_ALIAS=ksunext"
+              echo "KEY_PASSWORD=ksunext123"
+            } >> gradle.properties
+          fi
+
+      - name: Download arm64 ksud artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ksud-aarch64-linux-android
+          path: ${{ github.workspace }}/ksud-out/aarch64-linux-android
+
+      - name: Download x86_64 ksud artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ksud-x86_64-linux-android
+          path: ${{ github.workspace }}/ksud-out/x86_64-linux-android
+
+      - name: Embed ksud into Manager jniLibs as libksud.so
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          mkdir -p manager/app/src/main/jniLibs/x86_64
+
+          # Locate the compiled ksud binary regardless of nested artifact directory structure
+          ARM64_KSUD=$(find ksud-out/aarch64-linux-android -type f -name "ksud" | head -n 1)
+          X64_KSUD=$(find ksud-out/x86_64-linux-android -type f -name "ksud" | head -n 1)
+
+          cp -f "$ARM64_KSUD" manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          cp -f "$X64_KSUD" manager/app/src/main/jniLibs/x86_64/libksud.so
+          chmod 755 manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          chmod 755 manager/app/src/main/jniLibs/x86_64/libksud.so
+
+          ls -lh manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Build Manager Release APK
+        run: ./gradlew clean assembleRelease
+
+      - name: Verify libksud.so is inside the APK
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          echo "Built APK: $APK_PATH"
+          unzip -l "$APK_PATH" | grep "libksud.so"
+
+      - name: Upload Manager APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-Manager-DirtyFrag
+          path: manager/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload Standalone ksud (arm64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksud-aarch64-linux-android-standalone
+          path: manager/app/src/main/jniLibs/arm64-v8a/libksud.so
